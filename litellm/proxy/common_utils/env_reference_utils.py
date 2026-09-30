@@ -42,7 +42,7 @@ def reject_os_environ_references(params: dict) -> None:
     if contains_os_environ_reference(params):
         raise HTTPException(
             status_code=400,
-            detail={
+            detail={  # mutable-ok: HTTPException detail payload
                 "error": "Environment variable references are not permitted in request parameters."
-            },  # mutable-ok: HTTPException detail payload
+            },
         )
