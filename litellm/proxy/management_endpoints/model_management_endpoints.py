@@ -2030,7 +2030,10 @@ def _env_reference_violation(
     changed_params: Final = _changed_fields(litellm_params, stored_params)
     # Stored env references stay resolvable after any litellm_params edit (e.g. a new api_base),
     # so a non-admin may only change litellm_params when none remain in the merged result.
-    if changed_params and contains_os_environ_reference({**stored_params, **changed_params}):
+    if changed_params and (
+        contains_os_environ_reference(changed_params)
+        or any(contains_os_environ_reference(v) for k, v in stored_params.items() if k not in changed_params)
+    ):
         return next(
             (f"litellm_params.{key}" for key, value in changed_params.items() if contains_os_environ_reference(value)),
             f"litellm_params.{next(iter(changed_params))}",

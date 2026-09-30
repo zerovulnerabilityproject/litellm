@@ -7,8 +7,8 @@ OS_ENVIRON_PREFIX: Final = "os.environ/"
 
 
 def contains_os_environ_reference(value: object) -> bool:
-    stack: Final[list[object]] = [value]
-    seen: Final[set[int]] = set()
+    stack: Final[list[object]] = [value]  # mutable-ok: local DFS worklist
+    seen: Final[set[int]] = set()  # mutable-ok: local cycle guard for the DFS
 
     while stack:
         src = stack.pop()
@@ -42,5 +42,7 @@ def reject_os_environ_references(params: dict) -> None:
     if contains_os_environ_reference(params):
         raise HTTPException(
             status_code=400,
-            detail={"error": "Environment variable references are not permitted in request parameters."},
+            detail={
+                "error": "Environment variable references are not permitted in request parameters."
+            },  # mutable-ok: HTTPException detail payload
         )
