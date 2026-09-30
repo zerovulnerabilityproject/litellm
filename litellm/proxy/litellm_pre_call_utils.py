@@ -313,6 +313,12 @@ _UNTRUSTED_ROOT_CONTROL_FIELDS: Final = (
     # protection on a real deployment failure or force a false "not caller-controlled"
     # reading that lets its own bad timeout cool down deployments other tenants rely on.
     "client_side_timeout",
+    # Response-cache key overrides. The caching layer reads/writes the exact key
+    # given here instead of deriving it from the request params, so a client value
+    # would let one tenant read or plant entries under any key in the shared cache
+    # (including other tenants' entries and non-cache Redis keys).
+    "cache_key",
+    "preset_cache_key",
 )
 
 _UNTRUSTED_METADATA_CONTROL_FIELDS: Final = (
@@ -345,6 +351,7 @@ _UNTRUSTED_METADATA_CONTROL_FIELDS: Final = (
     "client_disconnected",
     "error_information",
     PRE_CALL_EXECUTED_GUARDRAILS_KEY,
+    "redis_namespace",
 )
 
 UNTRUSTED_REQUEST_HEADER_CONTROL_FIELDS: Final = frozenset(
@@ -2011,6 +2018,8 @@ async def add_litellm_data_to_request(
         if _allow_client_mock_response and _internal_key in _CLIENT_MOCK_CONTROL_FIELDS:
             continue
         data.pop(_internal_key, None)
+    if isinstance(_client_litellm_params := data.get("litellm_params"), dict):
+        _client_litellm_params.pop("preset_cache_key", None)
     _reject_url_valued_destinations(data)
     _raw_metadata_by_field: Final = {
         _metadata_field: data.pop(_metadata_field)
