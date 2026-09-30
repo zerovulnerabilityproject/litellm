@@ -1153,6 +1153,47 @@ async def test_add_litellm_data_to_request_strips_user_control_fields():
 
 
 @pytest.mark.asyncio
+async def test_add_litellm_data_to_request_strips_client_cache_key_overrides():
+    """A caller must not pick the response-cache key its request reads from / writes to."""
+    request_mock = MagicMock(spec=Request)
+    request_mock.url = MagicMock()
+    request_mock.url.path = "/v1/chat/completions"
+    request_mock.url.__str__.return_value = "http://localhost/v1/chat/completions"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    data = {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "hello"}],
+        "cache_key": "victim-sha256",
+        "preset_cache_key": "victim-sha256",
+        "litellm_params": {"preset_cache_key": "victim-sha256"},
+        "metadata": {"redis_namespace": "internal", "safe_user_metadata": "kept"},
+        "litellm_metadata": json.dumps({"redis_namespace": "internal"}),
+    }
+
+    updated = await add_litellm_data_to_request(
+        data=data,
+        request=request_mock,
+        user_api_key_dict=UserAPIKeyAuth(api_key="hashed-key"),
+        proxy_config=MagicMock(),
+        general_settings={},
+        version="test-version",
+    )
+
+    assert "cache_key" not in updated
+    assert "preset_cache_key" not in updated
+    assert "preset_cache_key" not in updated["litellm_params"]
+    assert "redis_namespace" not in updated["metadata"]
+    assert "redis_namespace" not in updated["metadata"].get("requester_metadata", {})
+    assert updated["metadata"]["safe_user_metadata"] == "kept"
+    assert "cache_key" not in updated["proxy_server_request"]["body"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "key_value, expected",
     [(True, True), (False, False), ("yes", None), (None, None)],
