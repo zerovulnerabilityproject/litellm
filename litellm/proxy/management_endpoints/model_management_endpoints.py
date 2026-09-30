@@ -66,6 +66,7 @@ from litellm.proxy.common_utils.encrypt_decrypt_utils import (
     decrypt_value_helper,
     encrypt_value_helper,
 )
+from litellm.proxy.common_utils.env_reference_utils import contains_os_environ_reference
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.db.routing_prisma_wrapper import WriterPinnedClient
 from litellm.proxy.management_endpoints.common_utils import _is_user_team_admin
@@ -1215,6 +1216,14 @@ async def patch_model(
             existing_litellm_params=db_model.litellm_params,
         )
 
+        ModelManagementAuthChecks.can_user_set_env_references(
+            litellm_params=patch_data.litellm_params,
+            model_info=patch_data.model_info,
+            user_api_key_dict=user_api_key_dict,
+            existing_litellm_params=db_model.litellm_params,
+            existing_model_info=db_model.model_info,
+        )
+
         _raise_on_strategy_router_write_violation(
             incoming_params=patch_data.litellm_params,
             existing_params=db_model.litellm_params,
@@ -1985,6 +1994,57 @@ def _canonical_session_tags(tags: Sequence[AwsSessionTag]) -> tuple[tuple[str, s
     return tuple(sorted((tag["Key"], tag["Value"]) for tag in tags))
 
 
+def _decrypted_stored_params(stored: BaseModel | None) -> Mapping[str, object]:
+    if stored is None:
+        return MappingProxyType({})
+    return MappingProxyType(
+        {
+            key: decrypt_value_helper(value=value, key=key, exception_type="debug", return_original_value=True)
+            if isinstance(value, str)
+            else value
+            for key, value in stored.model_dump(exclude_none=True).items()
+        }
+    )
+
+
+def _changed_fields(incoming: BaseModel | None, existing: Mapping[str, object]) -> Mapping[str, object]:
+    if incoming is None:
+        return MappingProxyType({})
+    return MappingProxyType(
+        {
+            key: value
+            for key, value in incoming.model_dump(exclude_unset=True, exclude_none=True).items()
+            if existing.get(key) != value
+        }
+    )
+
+
+def _env_reference_violation(
+    *,
+    litellm_params: GenericLiteLLMParams | None,
+    model_info: ModelInfo | None,
+    existing_litellm_params: GenericLiteLLMParams | None,
+    existing_model_info: ModelInfo | None,
+) -> str | None:
+    stored_params: Final = _decrypted_stored_params(existing_litellm_params)
+    changed_params: Final = _changed_fields(litellm_params, stored_params)
+    # Stored env references stay resolvable after any litellm_params edit (e.g. a new api_base),
+    # so a non-admin may only change litellm_params when none remain in the merged result.
+    if changed_params and (
+        contains_os_environ_reference(changed_params)
+        or any(contains_os_environ_reference(v) for k, v in stored_params.items() if k not in changed_params)
+    ):
+        return next(
+            (f"litellm_params.{key}" for key, value in changed_params.items() if contains_os_environ_reference(value)),
+            f"litellm_params.{next(iter(changed_params))}",
+        )
+    changed_info: Final = _changed_fields(model_info, _decrypted_stored_params(existing_model_info))
+    return next(
+        (f"model_info.{key}" for key, value in changed_info.items() if contains_os_environ_reference(value)),
+        None,
+    )
+
+
 class ModelManagementAuthChecks:
     """
     Common auth checks for model management endpoints
@@ -2060,6 +2120,37 @@ class ModelManagementAuthChecks:
             type=ProxyErrorTypes.auth_error.value,
             code=status.HTTP_403_FORBIDDEN,
             param="aws_session_tags",
+        )
+
+    @staticmethod
+    def can_user_set_env_references(
+        litellm_params: GenericLiteLLMParams | None,
+        model_info: ModelInfo | None,
+        user_api_key_dict: UserAPIKeyAuth,
+        existing_litellm_params: GenericLiteLLMParams | None = None,
+        existing_model_info: ModelInfo | None = None,
+    ) -> Literal[True]:
+        """
+        ``os.environ/`` references in litellm_params resolve against the proxy's own
+        environment when the model is loaded, so only a proxy admin may add them or
+        change the litellm_params of a model that carries them. Values already stored
+        on the model may be sent back unchanged.
+        """
+        if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN:
+            return True
+        offending: Final = _env_reference_violation(
+            litellm_params=litellm_params,
+            model_info=model_info,
+            existing_litellm_params=existing_litellm_params,
+            existing_model_info=existing_model_info,
+        )
+        if offending is None:
+            return True
+        raise ProxyException(
+            message=f"Only a proxy admin can set environment variable references (os.environ/...) on a model, or change the litellm_params of a model that uses them. Your role={user_api_key_dict.user_role}.",
+            type=ProxyErrorTypes.auth_error.value,
+            code=status.HTTP_403_FORBIDDEN,
+            param=offending,
         )
 
     @staticmethod
@@ -2432,6 +2523,12 @@ async def add_new_model(
             user_api_key_dict=user_api_key_dict,
         )
 
+        ModelManagementAuthChecks.can_user_set_env_references(
+            litellm_params=model_params.litellm_params,
+            model_info=model_params.model_info,
+            user_api_key_dict=user_api_key_dict,
+        )
+
         _raise_on_strategy_router_write_violation(
             incoming_params=model_params.litellm_params,
             existing_params=None,
@@ -2634,6 +2731,14 @@ async def update_model(
             litellm_params=model_params.litellm_params,
             user_api_key_dict=user_api_key_dict,
             existing_litellm_params=deployment.litellm_params,
+        )
+
+        ModelManagementAuthChecks.can_user_set_env_references(
+            litellm_params=model_params.litellm_params,
+            model_info=model_params.model_info,
+            user_api_key_dict=user_api_key_dict,
+            existing_litellm_params=deployment.litellm_params,
+            existing_model_info=deployment.model_info,
         )
 
         _raise_on_strategy_router_write_violation(

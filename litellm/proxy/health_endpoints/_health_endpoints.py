@@ -6,7 +6,7 @@ import os
 import secrets
 import time
 import traceback
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any, Final, Literal, TypedDict, cast
 
@@ -44,6 +44,9 @@ from litellm.proxy.auth.auth_utils import (
 )
 from litellm.proxy.auth.model_checks import get_key_models
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+from litellm.proxy.common_utils.env_reference_utils import (
+    reject_os_environ_references as _reject_os_environ_references,
+)
 from litellm.proxy.db.db_lookup_gate import db_lookup_stall_tracker
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
 from litellm.proxy.db.health_check_latest import (
@@ -82,39 +85,6 @@ class _HealthBacklogResponse(TypedDict):
     admitted_requests: ReadOnly[int]
     queued_requests: ReadOnly[int]
     rejected_requests: ReadOnly[int]
-
-
-def _reject_os_environ_references(params: dict) -> None:
-    """
-    Validate that the provided params do not contain any ``os.environ/``
-    references. Values with that prefix are expected to come only from
-    server-side configuration (already resolved before reaching here). If a
-    request-supplied value still carries the prefix, raise ``HTTPException``.
-    """
-    if not isinstance(params, dict):
-        return
-
-    stack: Final[list[object]] = [params]
-    seen: Final[set[int]] = {id(params)}
-
-    while stack:
-        src = stack.pop()
-        if isinstance(src, dict):
-            values: Iterable[object] = src.values()
-        elif isinstance(src, list):
-            values = src
-        else:
-            continue
-
-        for value in values:
-            if isinstance(value, str) and value.startswith("os.environ/"):
-                raise HTTPException(
-                    status_code=400,
-                    detail={"error": "Environment variable references are not permitted in request parameters."},
-                )
-            if isinstance(value, (dict, list)) and id(value) not in seen:
-                seen.add(id(value))
-                stack.append(value)
 
 
 _CONFIG_CONNECTION_FIELDS: Final[frozenset[str]] = frozenset(

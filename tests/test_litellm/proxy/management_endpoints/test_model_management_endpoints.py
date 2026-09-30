@@ -640,6 +640,207 @@ class TestModelManagementAuthChecks:
             )
         assert exc_info.value.code == "403"
 
+    def test_can_user_set_env_references_admin_success(self):
+        result = ModelManagementAuthChecks.can_user_set_env_references(
+            litellm_params=LiteLLM_Params(model="openai/gpt-4o", api_key="os.environ/OPENAI_API_KEY"),
+            model_info=ModelInfo(id="env-ref-admin"),
+            user_api_key_dict=self.admin_user,
+        )
+        assert result is True
+
+    def test_can_user_set_env_references_team_admin_fails(self):
+        with pytest.raises(ProxyException, match="environment variable references") as exc_info:
+            ModelManagementAuthChecks.can_user_set_env_references(
+                litellm_params=LiteLLM_Params(
+                    model="openai/gpt-4o", api_key="os.environ/LITELLM_MASTER_KEY", api_base="https://attacker.example"
+                ),
+                model_info=ModelInfo(id="env-ref-team-admin", team_id="test_team"),
+                user_api_key_dict=self.team_admin_user,
+            )
+        assert exc_info.value.code == "403"
+        assert exc_info.value.param == "litellm_params.api_key"
+
+    def test_can_user_set_env_references_nested_value_fails(self):
+        with pytest.raises(ProxyException) as exc_info:
+            ModelManagementAuthChecks.can_user_set_env_references(
+                litellm_params=LiteLLM_Params(
+                    model="openai/gpt-4o", extra_headers={"Authorization": "os.environ/LITELLM_MASTER_KEY"}
+                ),
+                model_info=None,
+                user_api_key_dict=self.team_admin_user,
+            )
+        assert exc_info.value.param == "litellm_params.extra_headers"
+
+    def test_can_user_set_env_references_model_info_fails(self):
+        with pytest.raises(ProxyException) as exc_info:
+            ModelManagementAuthChecks.can_user_set_env_references(
+                litellm_params=None,
+                model_info=ModelInfo(id="env-ref-info", team_id="test_team", custom_field="os.environ/SECRET"),
+                user_api_key_dict=self.team_admin_user,
+            )
+        assert exc_info.value.param == "model_info.custom_field"
+
+    def test_can_user_set_env_references_literal_values_allowed(self):
+        result = ModelManagementAuthChecks.can_user_set_env_references(
+            litellm_params=LiteLLM_Params(model="openai/gpt-4o", api_key="sk-team-owned", api_base="https://api.example"),
+            model_info=ModelInfo(id="env-ref-literal", team_id="test_team"),
+            user_api_key_dict=self.team_admin_user,
+        )
+        assert result is True
+
+    def test_can_user_set_env_references_unchanged_stored_reference_allowed(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_SALT_KEY", "sk-1234")
+        stored: Final = LiteLLM_Params(
+            model=encrypt_value_helper("openai/gpt-4o"),
+            api_key=encrypt_value_helper("os.environ/OPENAI_API_KEY"),
+        )
+        result = ModelManagementAuthChecks.can_user_set_env_references(
+            litellm_params=updateLiteLLMParams(model="openai/gpt-4o", api_key="os.environ/OPENAI_API_KEY"),
+            model_info=ModelInfo(id="env-ref-unchanged", team_id="test_team"),
+            user_api_key_dict=self.team_admin_user,
+            existing_litellm_params=stored,
+            existing_model_info=ModelInfo(id="env-ref-unchanged", team_id="test_team"),
+        )
+        assert result is True
+
+    def test_can_user_set_env_references_redirecting_stored_reference_fails(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_SALT_KEY", "sk-1234")
+        stored: Final = LiteLLM_Params(
+            model=encrypt_value_helper("openai/gpt-4o"),
+            api_key=encrypt_value_helper("os.environ/OPENAI_API_KEY"),
+        )
+        with pytest.raises(ProxyException) as exc_info:
+            ModelManagementAuthChecks.can_user_set_env_references(
+                litellm_params=updateLiteLLMParams(api_base="https://attacker.example"),
+                model_info=None,
+                user_api_key_dict=self.team_admin_user,
+                existing_litellm_params=stored,
+            )
+        assert exc_info.value.code == "403"
+        assert exc_info.value.param == "litellm_params.api_base"
+
+    def test_can_user_set_env_references_replacing_stored_reference_allowed(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_SALT_KEY", "sk-1234")
+        stored: Final = LiteLLM_Params(
+            model=encrypt_value_helper("openai/gpt-4o"),
+            api_key=encrypt_value_helper("os.environ/OPENAI_API_KEY"),
+        )
+        result = ModelManagementAuthChecks.can_user_set_env_references(
+            litellm_params=updateLiteLLMParams(api_key="sk-team-owned", api_base="https://api.example"),
+            model_info=None,
+            user_api_key_dict=self.team_admin_user,
+            existing_litellm_params=stored,
+        )
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_add_new_model_rejects_env_reference_for_non_admin(self):
+        from litellm.proxy.management_endpoints.model_management_endpoints import (
+            add_new_model,
+        )
+
+        mock_prisma = MagicMock()
+        with (
+            patch("litellm.proxy.proxy_server.prisma_client", mock_prisma),  # test-quality-ok: endpoint reads proxy server globals with no injection seam
+            patch("litellm.proxy.proxy_server.store_model_in_db", True),  # test-quality-ok: endpoint reads proxy server globals with no injection seam
+            patch("litellm.proxy.proxy_server.premium_user", True),  # test-quality-ok: endpoint reads proxy server globals with no injection seam
+            patch(  # test-quality-ok: prior auth check needs a live DB; only the env reference check is under test
+                "litellm.proxy.management_endpoints.model_management_endpoints.ModelManagementAuthChecks.can_user_make_model_call",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            with pytest.raises(ProxyException) as exc_info:
+                await add_new_model(
+                    model_params=Deployment(
+                        model_name="exfil-model",
+                        litellm_params=LiteLLM_Params(
+                            model="openai/gpt-4o",
+                            api_key="os.environ/LITELLM_MASTER_KEY",
+                            api_base="https://attacker.example",
+                        ),
+                        model_info={"id": "env-ref-create-test", "team_id": "test_team"},
+                    ),
+                    user_api_key_dict=self.team_admin_user,
+                )
+            assert exc_info.value.code == "403"
+            assert exc_info.value.param == "litellm_params.api_key"
+            mock_prisma.db.litellm_proxymodeltable.create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_patch_model_rejects_env_reference_for_non_admin(self):
+        model_id = "env-ref-patch-test"
+        db_model = Deployment(
+            model_name="team-model",
+            litellm_params=LiteLLM_Params(model="openai/gpt-4o", api_key="sk-team-owned"),
+            model_info={"id": model_id, "team_id": "test_team"},
+        )
+        with (
+            patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),  # test-quality-ok: endpoint reads proxy server globals with no injection seam
+            patch("litellm.proxy.proxy_server.llm_router", MagicMock()),  # test-quality-ok: endpoint reads proxy server globals with no injection seam
+            patch("litellm.proxy.proxy_server.store_model_in_db", True),  # test-quality-ok: endpoint reads proxy server globals with no injection seam
+            patch("litellm.proxy.proxy_server.premium_user", True),  # test-quality-ok: endpoint reads proxy server globals with no injection seam
+            patch(  # test-quality-ok: stubs the DB row fetch; only the env reference check is under test
+                "litellm.proxy.management_endpoints.model_management_endpoints.get_db_model",
+                new=AsyncMock(return_value=db_model),
+            ),
+            patch(  # test-quality-ok: prior auth check needs a live DB; only the env reference check is under test
+                "litellm.proxy.management_endpoints.model_management_endpoints.ModelManagementAuthChecks.can_user_make_model_call",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(  # test-quality-ok: asserts the DB write is never reached on rejection
+                "litellm.proxy.management_endpoints.model_management_endpoints._update_team_model_in_db",
+                new=AsyncMock(),
+            ) as mock_update,
+        ):
+            with pytest.raises(ProxyException) as exc_info:
+                await patch_model(
+                    model_id=model_id,
+                    patch_data=updateDeployment(
+                        litellm_params=updateLiteLLMParams(api_key="os.environ/LITELLM_MASTER_KEY")
+                    ),
+                    user_api_key_dict=self.team_admin_user,
+                )
+            assert exc_info.value.code == "403"
+            assert exc_info.value.param == "litellm_params.api_key"
+            mock_update.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_update_model_rejects_env_reference_for_non_admin(self):
+        model_id = "env-ref-put-test"
+        existing = Deployment(
+            model_name="team-model",
+            litellm_params=LiteLLM_Params(model="openai/gpt-4o", api_key="sk-team-owned"),
+            model_info={"id": model_id, "team_id": "test_team"},
+        )
+        existing_row = MagicMock()
+        existing_row.model_dump.return_value = existing.model_dump()
+        mock_prisma = MagicMock()
+        mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(return_value=existing_row)
+        mock_prisma.db.litellm_proxymodeltable.update = AsyncMock()
+        with (
+            patch("litellm.proxy.proxy_server.prisma_client", mock_prisma),  # test-quality-ok: endpoint reads proxy server globals with no injection seam
+            patch("litellm.proxy.proxy_server.llm_router", None),  # test-quality-ok: endpoint reads proxy server globals with no injection seam
+            patch("litellm.proxy.proxy_server.store_model_in_db", True),  # test-quality-ok: endpoint reads proxy server globals with no injection seam
+            patch("litellm.proxy.proxy_server.premium_user", True),  # test-quality-ok: endpoint reads proxy server globals with no injection seam
+            patch(  # test-quality-ok: prior auth check needs a live DB; only the env reference check is under test
+                "litellm.proxy.management_endpoints.model_management_endpoints.ModelManagementAuthChecks.can_user_make_model_call",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            with pytest.raises(ProxyException) as exc_info:
+                await update_model(
+                    model_params=updateDeployment(
+                        litellm_params=updateLiteLLMParams(
+                            api_key="os.environ/LITELLM_MASTER_KEY", api_base="https://attacker.example"
+                        ),
+                        model_info=ModelInfo(id=model_id),
+                    ),
+                    user_api_key_dict=self.team_admin_user,
+                )
+            assert exc_info.value.code == "403"
+            assert exc_info.value.param == "litellm_params.api_key"
+            mock_prisma.db.litellm_proxymodeltable.update.assert_not_awaited()
+
 
 class MockModelTable:
     def __init__(self, model_aliases: Dict[str, str], include: Optional[dict] = None):
