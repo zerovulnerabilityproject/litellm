@@ -3453,7 +3453,7 @@ class TestOpenAIPassthroughRoute:
         mock_request.url = MagicMock()
         mock_request.url.path = "/v1/assistants"
         mock_response = MagicMock(spec=Response)
-        mock_user_api_key_dict = MagicMock()
+        mock_user_api_key_dict = UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN)
 
         with (
             patch(
@@ -3486,6 +3486,128 @@ class TestOpenAIPassthroughRoute:
 
             # Verify result
             assert result == {"id": "asst_123", "object": "assistant"}
+
+    @staticmethod
+    def _openai_passthrough_request(method: str, path: str) -> Request:
+        return Request(
+            {
+                "type": "http",
+                "method": method,
+                "path": path,
+                "root_path": "",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method", "endpoint"),
+        [
+            ("GET", "v1/files"),
+            ("GET", "v1/files/file-abc/content"),
+            ("DELETE", "v1/files/file-abc"),
+            ("GET", "v1/batches"),
+            ("GET", "v1/vector_stores/vs_1"),
+            ("GET", "v1/assistants"),
+            ("POST", "v1/threads/thread_1/messages"),
+            ("GET", "v1/fine_tuning/jobs"),
+            ("GET", "v1/responses/resp_1"),
+            ("DELETE", "v1/responses/resp_1"),
+            ("GET", "v1/chat/completions"),
+            ("DELETE", "v1/models/ft:gpt-4o:org:abc"),
+            ("GET", "v1/chat/../files"),
+            ("GET", "V1/Files"),
+        ],
+    )
+    async def test_openai_passthrough_refuses_shared_objects_for_non_admin(self, method, endpoint):
+        user_api_key_dict = UserAPIKeyAuth(
+            api_key="sk-internal",
+            user_role=LitellmUserRoles.INTERNAL_USER,
+            models=["gpt-4o-mini"],
+        )
+
+        with (
+            patch(
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials",
+                return_value="sk-test-key",
+            ),
+            patch(
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+            ) as mock_create_route,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await openai_proxy_route(
+                    endpoint=endpoint,
+                    request=self._openai_passthrough_request(method, f"/openai_passthrough/{endpoint}"),
+                    fastapi_response=MagicMock(spec=Response),
+                    user_api_key_dict=user_api_key_dict,
+                )
+
+        assert exc_info.value.status_code == 403
+        mock_create_route.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method", "endpoint"),
+        [
+            ("POST", "v1/chat/completions"),
+            ("POST", "v1/responses"),
+            ("POST", "v1/embeddings"),
+            ("GET", "v1/models"),
+            ("GET", "v1/models/gpt-4o-mini"),
+        ],
+    )
+    async def test_openai_passthrough_allows_model_scoped_calls_for_non_admin(self, method, endpoint):
+        user_api_key_dict = UserAPIKeyAuth(api_key="sk-internal", user_role=LitellmUserRoles.INTERNAL_USER)
+
+        with (
+            patch(
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials",
+                return_value="sk-test-key",
+            ),
+            patch(
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+            ) as mock_create_route,
+        ):
+            mock_create_route.return_value = AsyncMock(return_value={"ok": True})
+            result = await openai_proxy_route(
+                endpoint=endpoint,
+                request=self._openai_passthrough_request(method, f"/openai/{endpoint}"),
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=user_api_key_dict,
+            )
+
+        assert result == {"ok": True}
+        mock_create_route.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_openai_passthrough_allows_shared_objects_with_passthrough_grant(self):
+        user_api_key_dict = UserAPIKeyAuth(
+            api_key="sk-internal",
+            user_role=LitellmUserRoles.INTERNAL_USER,
+            metadata={"allowed_passthrough_routes": ["/openai_passthrough/v1/files"]},
+        )
+
+        with (
+            patch(
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials",
+                return_value="sk-test-key",
+            ),
+            patch(
+                "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+            ) as mock_create_route,
+        ):
+            mock_create_route.return_value = AsyncMock(return_value={"data": []})
+            result = await openai_proxy_route(
+                endpoint="v1/files",
+                request=self._openai_passthrough_request("GET", "/openai_passthrough/v1/files"),
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=user_api_key_dict,
+            )
+
+        assert result == {"data": []}
+        assert mock_create_route.call_args[1]["target"] == "https://api.openai.com/v1/files"
 
 
 def _resolve_route_name(method: str, path: str) -> str | None:
@@ -3556,8 +3678,31 @@ def openai_passthrough_client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestC
     monkeypatch.delenv("SERVER_ROOT_PATH", raising=False)
     monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
     litellm.in_memory_llm_clients_cache.flush_cache()
-    monkeypatch.setitem(app.dependency_overrides, user_api_key_auth, lambda: UserAPIKeyAuth(api_key="sk-virtual"))
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        user_api_key_auth,
+        lambda: UserAPIKeyAuth(api_key="sk-virtual", user_role=LitellmUserRoles.PROXY_ADMIN),
+    )
     yield TestClient(app)
+
+
+@pytest.mark.parametrize("path", ["/v1/files", "/v1/files/file-abc123/content", "/v1/responses/resp_123"])
+def test_openai_passthrough_refuses_shared_objects_for_non_admin_key(
+    openai_passthrough_client: TestClient, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    from litellm.proxy.proxy_server import app
+
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        user_api_key_auth,
+        lambda: UserAPIKeyAuth(api_key="sk-virtual", user_role=LitellmUserRoles.INTERNAL_USER),
+    )
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as upstream:
+        route = upstream.route(host="api.openai.com").mock(return_value=httpx.Response(200, json={"data": []}))
+        response = openai_passthrough_client.get(f"/openai_passthrough{path}")
+
+        assert response.status_code == 403
+        assert not route.called
 
 
 @pytest.mark.parametrize(

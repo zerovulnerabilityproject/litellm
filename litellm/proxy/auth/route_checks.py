@@ -733,6 +733,15 @@ class RouteChecks:
         raise RouteChecks._auth_pass_through_denied_exception(route=route)
 
     @staticmethod
+    def has_pass_through_grant(route: str, valid_token: UserAPIKeyAuth) -> bool:
+        """``allowed_passthrough_routes`` on the key or team, or an explicit JWT ``team_allowed_routes`` entry."""
+        return RouteChecks.check_passthrough_route_access(
+            route=route, user_api_key_dict=valid_token
+        ) or RouteChecks.jwt_team_routes_grant_pass_through(
+            route=route, team_allowed_routes=RouteChecks._jwt_team_allowed_routes(valid_token=valid_token)
+        )
+
+    @staticmethod
     def check_passthrough_route_access(route: str, user_api_key_dict: UserAPIKeyAuth) -> bool:
         """
         Check if route is a passthrough route.

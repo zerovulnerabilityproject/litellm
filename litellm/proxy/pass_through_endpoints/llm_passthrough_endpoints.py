@@ -59,6 +59,7 @@ from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 from litellm.passthrough.main import AsyncPassthroughStreamingResponse
 from litellm.proxy._types import *
 from litellm.proxy.auth.auth_checks import enforced_model_allowlists
+from litellm.proxy.auth.auth_utils import get_request_route
 from litellm.proxy.auth.handle_jwt import JWTHandler
 from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy.auth.user_api_key_auth import (
@@ -2882,6 +2883,53 @@ async def vertex_proxy_route(
     )
 
 
+_OPENAI_PASSTHROUGH_MODEL_SCOPED_ENDPOINTS: Final = frozenset(
+    {
+        ("POST", "chat/completions"),
+        ("POST", "completions"),
+        ("POST", "embeddings"),
+        ("POST", "responses"),
+        ("POST", "moderations"),
+        ("POST", "images/generations"),
+        ("POST", "images/edits"),
+        ("POST", "images/variations"),
+        ("POST", "audio/speech"),
+        ("POST", "audio/transcriptions"),
+        ("POST", "audio/translations"),
+        ("GET", "models"),
+    }
+)
+
+
+def _openai_passthrough_resource_path(endpoint: str) -> str:
+    """The OpenAI resource path the request is forwarded to, without the ``v1/`` prefix."""
+    resolved_path: Final = posixpath.normpath(f"/{httpx.URL(endpoint).path.lstrip('/')}").strip("/").lower()
+    if resolved_path == "v1":
+        return ""
+    return resolved_path.removeprefix("v1/")
+
+
+def is_openai_passthrough_model_scoped_request(method: object, endpoint: str) -> bool:
+    """
+    True for OpenAI calls that name a model and hold no provider-side state, so model access checks
+    cover them. Everything else (files, batches, vector stores, assistants, threads, fine-tuning,
+    stored responses/completions, ...) reads or mutates objects in the proxy's shared OpenAI org.
+    """
+    if not isinstance(method, str):
+        return False
+    normalized_method: Final = method.upper()
+    resource_path: Final = _openai_passthrough_resource_path(endpoint)
+    if normalized_method == "GET" and resource_path.startswith("models/") and resource_path.count("/") == 1:
+        return True
+    return (normalized_method, resource_path) in _OPENAI_PASSTHROUGH_MODEL_SCOPED_ENDPOINTS
+
+
+def _openai_passthrough_resource_access_granted(request: Request, user_api_key_dict: UserAPIKeyAuth) -> bool:
+    if is_proxy_admin(user_api_key_dict):
+        return True
+    return RouteChecks.has_pass_through_grant(route=get_request_route(request), valid_token=user_api_key_dict)
+
+
 @router.api_route(
     "/openai/{endpoint:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
@@ -2924,6 +2972,18 @@ async def openai_proxy_route(
     )
     if openai_api_key is None:
         raise Exception("Required 'OPENAI_API_KEY' in environment to make pass-through calls to OpenAI.")
+    if not is_openai_passthrough_model_scoped_request(
+        request.method, endpoint
+    ) and not _openai_passthrough_resource_access_granted(request=request, user_api_key_dict=user_api_key_dict):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"{request.method} /{endpoint.lstrip('/')} reads or changes objects in the proxy's shared OpenAI "
+                "organization, so it is limited to proxy admin keys and keys or teams whose "
+                "`allowed_passthrough_routes` include this route. Use LiteLLM's native endpoints "
+                "(e.g. /v1/files, /v1/batches, /v1/responses) for per-tenant access."
+            ),
+        )
 
     return await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
         endpoint=endpoint,
