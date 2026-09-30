@@ -13,6 +13,10 @@ from collections.abc import Mapping
 from typing import Final
 
 from litellm._logging import verbose_logger
+from litellm.litellm_core_utils.prompt_templates.image_handling import (
+    async_convert_url_to_base64,
+    convert_url_to_base64,
+)
 from litellm.llms.custom_httpx.http_handler import (
     _get_httpx_client,
     get_async_httpx_client,
@@ -50,39 +54,22 @@ def _parse_data_url(data_url: str) -> tuple[bytes, str, str] | None:
     return content_bytes, content_type, ext
 
 
-def _content_type_or_default(headers: Mapping[str, str]) -> str:
-    """Return the response's ``content-type`` header, falling back to ``image/jpeg`` when absent."""
-    try:
-        return headers["content-type"]
-    except KeyError:
-        return "image/jpeg"
+def _decode_fetched_image(data_url: str) -> tuple[bytes, str, str]:
+    """Split a ``data:<type>;base64,<payload>`` URL produced by the SSRF-safe image fetcher."""
+    header, _, base64_data = data_url.partition(";base64,")
+    content_type: Final = header.removeprefix("data:") or "image/jpeg"
+    ext: Final = content_type.split("/")[-1].split(";")[0].strip() or "jpg"
+    return base64.b64decode(base64_data), content_type, ext
 
 
 def _download_image_sync(url: str) -> tuple[bytes, str, str]:
-    """Download image from URL synchronously."""
-    client: Final = _get_httpx_client(params={"ssl_verify": False})
-    response: Final = client.get(url)
-    response.raise_for_status()
-
-    content_type: Final = _content_type_or_default(response.headers)
-    ext: Final = content_type.split("/")[-1].split(";")[0] or "jpg"
-
-    return response.content, content_type, ext
+    """Download image from URL synchronously, validating every hop against blocked networks."""
+    return _decode_fetched_image(convert_url_to_base64(url))
 
 
 async def _download_image_async(url: str) -> tuple[bytes, str, str]:
-    """Download image from URL asynchronously."""
-    client: Final = get_async_httpx_client(
-        llm_provider=LlmProviders.GIGACHAT,
-        params={"ssl_verify": False},
-    )
-    response: Final = await client.get(url)
-    response.raise_for_status()
-
-    content_type: Final = _content_type_or_default(response.headers)
-    ext: Final = content_type.split("/")[-1].split(";")[0] or "jpg"
-
-    return response.content, content_type, ext
+    """Download image from URL asynchronously, validating every hop against blocked networks."""
+    return _decode_fetched_image(await async_convert_url_to_base64(url))
 
 
 def upload_file_sync(

@@ -6,12 +6,13 @@ upload_file_sync, and upload_file_async covering caching, base64 data URL decodi
 network errors, and the full upload flow.
 """
 
-import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
+import litellm
+from litellm.litellm_core_utils.prompt_templates import image_handling
 from litellm.llms.gigachat import file_handler
 from litellm.llms.gigachat.file_handler import (
     _file_cache,
@@ -24,10 +25,7 @@ from litellm.llms.gigachat.file_handler import (
 FILE_MODULE = "litellm.llms.gigachat.file_handler"
 
 # A valid 1x1 red PNG as base64
-_RED_PNG_B64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAA"
-    "DUlEQVQI12NgYPgPAAEDAQAR3X3ZAAAASUVORK5CYII="
-)
+_RED_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQI12NgYPgPAAEDAQAR3X3ZAAAASUVORK5CYII="
 _RED_PNG_DATA_URL = f"data:image/png;base64,{_RED_PNG_B64}"
 
 
@@ -122,67 +120,84 @@ class TestParseDataUrl:
         assert ext == "octet-stream"
 
 
+_PUBLIC_IMAGE_URL = "https://93.184.215.14/img.png"
+_METADATA_URL = "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+
+
+def _image_response(url: str, content: bytes, content_type: str) -> httpx.Response:
+    return httpx.Response(
+        status_code=200,
+        headers={"Content-Type": content_type},
+        content=content,
+        request=httpx.Request("GET", url),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_image_cache():
+    image_handling.in_memory_cache.flush_cache()
+    yield
+    image_handling.in_memory_cache.flush_cache()
+
+
 # ---------------------------------------------------------------------------
 # _download_image_sync
 # ---------------------------------------------------------------------------
 
 
 class TestDownloadImageSync:
-    @patch(f"{FILE_MODULE}._get_httpx_client")
-    def test_downloads_image_successfully(self, mock_http_handler_cls):
+    def test_downloads_image_successfully(self):
         mock_client = MagicMock()
-        mock_response = MagicMock()
-        mock_response.content = b"fake-image-bytes"
-        mock_response.headers = {"content-type": "image/jpeg"}
-        mock_client.get.return_value = mock_response
-        mock_http_handler_cls.return_value = mock_client
+        mock_client.get.return_value = _image_response(_PUBLIC_IMAGE_URL, b"fake-image-bytes", "image/png")
 
-        content_bytes, content_type, ext = file_handler._download_image_sync("https://example.com/img.jpg")
+        with patch.object(litellm, "module_level_client", mock_client):
+            content_bytes, content_type, ext = file_handler._download_image_sync(_PUBLIC_IMAGE_URL)
 
-        assert content_bytes == b"fake-image-bytes"
-        assert content_type == "image/jpeg"
-        assert ext == "jpeg"
-        mock_client.get.assert_called_once_with("https://example.com/img.jpg")
+        assert (content_bytes, content_type, ext) == (b"fake-image-bytes", "image/png", "png")
+        assert mock_client.get.call_args.kwargs["follow_redirects"] is False
 
-    @patch(f"{FILE_MODULE}._get_httpx_client")
-    def test_raises_on_http_error(self, mock_http_handler_cls):
+    def test_blocks_metadata_address_without_request(self):
         mock_client = MagicMock()
-        mock_client.get.side_effect = httpx.HTTPStatusError(
-            "Not Found",
-            request=httpx.Request("GET", "https://example.com/404"),
-            response=httpx.Response(status_code=404, request=httpx.Request("GET", "https://example.com/404")),
+
+        with patch.object(litellm, "module_level_client", mock_client):
+            with pytest.raises(litellm.ImageFetchError):
+                file_handler._download_image_sync(_METADATA_URL)
+
+        mock_client.get.assert_not_called()
+
+    def test_blocks_redirect_to_private_address(self):
+        mock_client = MagicMock()
+        mock_client.get.return_value = httpx.Response(
+            status_code=302,
+            headers={"Location": _METADATA_URL},
+            request=httpx.Request("GET", _PUBLIC_IMAGE_URL),
         )
-        mock_http_handler_cls.return_value = mock_client
 
-        with pytest.raises(httpx.HTTPStatusError):
-            file_handler._download_image_sync("https://example.com/404")
+        with patch.object(litellm, "module_level_client", mock_client):
+            with pytest.raises(litellm.ImageFetchError):
+                file_handler._download_image_sync(_PUBLIC_IMAGE_URL)
 
-    @patch(f"{FILE_MODULE}._get_httpx_client")
-    def test_parse_content_type_fallback(self, mock_http_handler_cls):
+        assert [c.args[0] for c in mock_client.get.call_args_list] == [_PUBLIC_IMAGE_URL]
+
+    def test_rejects_oversized_image(self):
         mock_client = MagicMock()
-        mock_response = MagicMock()
-        mock_response.content = b"data"
-        mock_response.headers = {}
-        mock_client.get.return_value = mock_response
-        mock_http_handler_cls.return_value = mock_client
+        mock_client.get.return_value = _image_response(_PUBLIC_IMAGE_URL, b"x" * 2048, "image/png")
 
-        _, content_type, ext = file_handler._download_image_sync("https://example.com/img")
+        with (
+            patch.object(litellm, "module_level_client", mock_client),
+            patch.object(image_handling, "MAX_IMAGE_URL_DOWNLOAD_SIZE_MB", 1 / 1024),
+        ):
+            with pytest.raises(litellm.ImageFetchError):
+                file_handler._download_image_sync(_PUBLIC_IMAGE_URL)
 
-        assert content_type == "image/jpeg"
-        assert ext == "jpeg"
-
-    @patch(f"{FILE_MODULE}._get_httpx_client")
-    def test_extracts_extension_from_parametrized_type(self, mock_http_handler_cls):
+    def test_extracts_extension_from_parametrized_type(self):
         mock_client = MagicMock()
-        mock_response = MagicMock()
-        mock_response.content = b"data"
-        mock_response.headers = {"content-type": "image/png; charset=utf-8"}
-        mock_client.get.return_value = mock_response
-        mock_http_handler_cls.return_value = mock_client
+        mock_client.get.return_value = _image_response(_PUBLIC_IMAGE_URL, b"data", "image/png; charset=utf-8")
 
-        _, _, ext = file_handler._download_image_sync("https://example.com/img.png")
+        with patch.object(litellm, "module_level_client", mock_client):
+            content_bytes, _, ext = file_handler._download_image_sync(_PUBLIC_IMAGE_URL)
 
-        assert ext == "png"
+        assert (content_bytes, ext) == (b"data", "png")
 
 
 # ---------------------------------------------------------------------------
@@ -192,39 +207,25 @@ class TestDownloadImageSync:
 
 class TestDownloadImageAsync:
     @pytest.mark.asyncio
-    @patch(f"{FILE_MODULE}.get_async_httpx_client")
-    async def test_downloads_image_successfully(self, mock_get_client):
+    async def test_downloads_image_successfully(self):
         mock_client = MagicMock()
-        mock_response = MagicMock()
-        mock_response.content = b"fake-image-bytes"
-        mock_response.headers = {"content-type": "image/webp"}
-        mock_client.get = AsyncMock(return_value=mock_response)
-        mock_get_client.return_value = mock_client
+        mock_client.get = AsyncMock(return_value=_image_response(_PUBLIC_IMAGE_URL, b"fake-image-bytes", "image/webp"))
 
-        content_bytes, content_type, ext = await file_handler._download_image_async(
-            "https://example.com/img.webp"
-        )
+        with patch.object(litellm, "module_level_aclient", mock_client):
+            content_bytes, content_type, ext = await file_handler._download_image_async(_PUBLIC_IMAGE_URL)
 
-        assert content_bytes == b"fake-image-bytes"
-        assert content_type == "image/webp"
-        assert ext == "webp"
-        mock_client.get.assert_called_once_with("https://example.com/img.webp")
+        assert (content_bytes, content_type, ext) == (b"fake-image-bytes", "image/webp", "webp")
 
     @pytest.mark.asyncio
-    @patch(f"{FILE_MODULE}.get_async_httpx_client")
-    async def test_raises_on_http_error(self, mock_get_client):
+    async def test_blocks_metadata_address_without_request(self):
         mock_client = MagicMock()
-        mock_client.get = AsyncMock(
-            side_effect=httpx.HTTPStatusError(
-                "Forbidden",
-                request=httpx.Request("GET", "https://example.com/403"),
-                response=httpx.Response(status_code=403, request=httpx.Request("GET", "https://example.com/403")),
-            )
-        )
-        mock_get_client.return_value = mock_client
+        mock_client.get = AsyncMock()
 
-        with pytest.raises(httpx.HTTPStatusError):
-            await file_handler._download_image_async("https://example.com/403")
+        with patch.object(litellm, "module_level_aclient", mock_client):
+            with pytest.raises(litellm.ImageFetchError):
+                await file_handler._download_image_async(_METADATA_URL)
+
+        mock_client.get.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -236,9 +237,7 @@ class TestUploadFileSync:
     @patch(f"{FILE_MODULE}.get_api_base", return_value="https://api.example.com")
     @patch(f"{FILE_MODULE}.get_access_token", return_value="test-token")
     @patch(f"{FILE_MODULE}._get_httpx_client")
-    def test_uploads_base64_image_and_caches(
-        self, mock_http_handler_cls, mock_get_token, mock_get_api_base
-    ):
+    def test_uploads_base64_image_and_caches(self, mock_http_handler_cls, mock_get_token, mock_get_api_base):
         mock_client = MagicMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {"id": "file-12345"}
@@ -269,9 +268,7 @@ class TestUploadFileSync:
     @patch(f"{FILE_MODULE}.get_api_base", return_value="https://api.example.com")
     @patch(f"{FILE_MODULE}.get_access_token", return_value="test-token")
     @patch(f"{FILE_MODULE}._get_httpx_client")
-    def test_returns_cached_file_id(
-        self, mock_http_handler_cls, mock_get_token, mock_get_api_base
-    ):
+    def test_returns_cached_file_id(self, mock_http_handler_cls, mock_get_token, mock_get_api_base):
         # Pre-populate the cache
         url_hash = _get_url_hash(_RED_PNG_DATA_URL)
         _file_cache[url_hash] = "cached-file-id"
@@ -297,9 +294,7 @@ class TestUploadFileSync:
         mock_client.post.return_value = mock_response
         mock_http_handler_cls.return_value = mock_client
 
-        result = upload_file_sync(
-            image_url="https://example.com/remote.png", credentials="creds"
-        )
+        result = upload_file_sync(image_url="https://example.com/remote.png", credentials="creds")
 
         assert result == "file-remote"
         mock_download.assert_called_once_with("https://example.com/remote.png")
@@ -307,9 +302,7 @@ class TestUploadFileSync:
     @patch(f"{FILE_MODULE}._get_httpx_client")
     @patch(f"{FILE_MODULE}.get_access_token", return_value="test-token")
     @patch(f"{FILE_MODULE}.get_api_base", return_value="https://api.example.com")
-    def test_returns_none_on_upload_failure(
-        self, mock_get_api_base, mock_get_token, mock_http_handler_cls
-    ):
+    def test_returns_none_on_upload_failure(self, mock_get_api_base, mock_get_token, mock_http_handler_cls):
         mock_client = MagicMock()
         mock_client.post.side_effect = httpx.HTTPStatusError(
             "Bad Request",
@@ -319,18 +312,14 @@ class TestUploadFileSync:
         mock_http_handler_cls.return_value = mock_client
 
         # upload_file_sync catches all exceptions and returns None
-        result = upload_file_sync(
-            image_url=_RED_PNG_DATA_URL, credentials="creds"
-        )
+        result = upload_file_sync(image_url=_RED_PNG_DATA_URL, credentials="creds")
 
         assert result is None
 
     @patch(f"{FILE_MODULE}._get_httpx_client")
     @patch(f"{FILE_MODULE}.get_access_token", return_value="test-token")
     @patch(f"{FILE_MODULE}.get_api_base", return_value="https://api.example.com")
-    def test_returns_none_when_response_missing_id(
-        self, mock_get_api_base, mock_get_token, mock_http_handler_cls
-    ):
+    def test_returns_none_when_response_missing_id(self, mock_get_api_base, mock_get_token, mock_http_handler_cls):
         mock_client = MagicMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {"status": "ok"}  # no "id" key
@@ -338,12 +327,9 @@ class TestUploadFileSync:
         mock_client.post.return_value = mock_response
         mock_http_handler_cls.return_value = mock_client
 
-        result = upload_file_sync(
-            image_url=_RED_PNG_DATA_URL, credentials="creds"
-        )
+        result = upload_file_sync(image_url=_RED_PNG_DATA_URL, credentials="creds")
 
         assert result is None
-
 
 
 # ---------------------------------------------------------------------------
@@ -356,9 +342,7 @@ class TestUploadFileAsync:
     @patch(f"{FILE_MODULE}.get_api_base", return_value="https://api.example.com")
     @patch(f"{FILE_MODULE}.get_access_token_async", return_value="test-token-async")
     @patch(f"{FILE_MODULE}.get_async_httpx_client")
-    async def test_uploads_base64_image_and_caches(
-        self, mock_get_client, mock_get_token, mock_get_api_base
-    ):
+    async def test_uploads_base64_image_and_caches(self, mock_get_client, mock_get_token, mock_get_api_base):
         mock_client = MagicMock()
         mock_response = MagicMock()
         mock_response.json = MagicMock(return_value={"id": "async-file-1"})
@@ -388,9 +372,7 @@ class TestUploadFileAsync:
     @patch(f"{FILE_MODULE}.get_api_base", return_value="https://api.example.com")
     @patch(f"{FILE_MODULE}.get_access_token_async", return_value="test-token-async")
     @patch(f"{FILE_MODULE}.get_async_httpx_client")
-    async def test_returns_cached_file_id(
-        self, mock_get_client, mock_get_token, mock_get_api_base
-    ):
+    async def test_returns_cached_file_id(self, mock_get_client, mock_get_token, mock_get_api_base):
         url_hash = _get_url_hash(_RED_PNG_DATA_URL)
         _file_cache[url_hash] = "cached-async-id"
 
@@ -415,9 +397,7 @@ class TestUploadFileAsync:
         mock_client.post = AsyncMock(return_value=mock_response)
         mock_get_client.return_value = mock_client
 
-        result = await upload_file_async(
-            image_url="https://example.com/remote.png", credentials="creds"
-        )
+        result = await upload_file_async(image_url="https://example.com/remote.png", credentials="creds")
 
         assert result == "async-file-remote"
         mock_download.assert_called_once_with("https://example.com/remote.png")
@@ -426,22 +406,20 @@ class TestUploadFileAsync:
     @patch(f"{FILE_MODULE}.get_async_httpx_client")
     @patch(f"{FILE_MODULE}.get_access_token_async", return_value="test-token-async")
     @patch(f"{FILE_MODULE}.get_api_base", return_value="https://api.example.com")
-    async def test_returns_none_on_upload_failure(
-        self, mock_get_api_base, mock_get_token, mock_get_client
-    ):
+    async def test_returns_none_on_upload_failure(self, mock_get_api_base, mock_get_token, mock_get_client):
         mock_client = MagicMock()
         mock_client.post = AsyncMock(
             side_effect=httpx.HTTPStatusError(
                 "Bad Request",
                 request=httpx.Request("POST", "https://api.example.com/files"),
-                response=httpx.Response(status_code=400, request=httpx.Request("POST", "https://api.example.com/files")),
+                response=httpx.Response(
+                    status_code=400, request=httpx.Request("POST", "https://api.example.com/files")
+                ),
             )
         )
         mock_get_client.return_value = mock_client
 
-        result = await upload_file_async(
-            image_url=_RED_PNG_DATA_URL, credentials="creds"
-        )
+        result = await upload_file_async(image_url=_RED_PNG_DATA_URL, credentials="creds")
 
         assert result is None
 
@@ -449,9 +427,7 @@ class TestUploadFileAsync:
     @patch(f"{FILE_MODULE}.get_async_httpx_client")
     @patch(f"{FILE_MODULE}.get_access_token_async", return_value="test-token-async")
     @patch(f"{FILE_MODULE}.get_api_base", return_value="https://api.example.com")
-    async def test_returns_none_when_response_missing_id(
-        self, mock_get_api_base, mock_get_token, mock_get_client
-    ):
+    async def test_returns_none_when_response_missing_id(self, mock_get_api_base, mock_get_token, mock_get_client):
         mock_client = MagicMock()
         mock_response = MagicMock()
         mock_response.json = MagicMock(return_value={"status": "ok"})
@@ -459,8 +435,6 @@ class TestUploadFileAsync:
         mock_client.post = AsyncMock(return_value=mock_response)
         mock_get_client.return_value = mock_client
 
-        result = await upload_file_async(
-            image_url=_RED_PNG_DATA_URL, credentials="creds"
-        )
+        result = await upload_file_async(image_url=_RED_PNG_DATA_URL, credentials="creds")
 
         assert result is None
